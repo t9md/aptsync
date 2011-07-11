@@ -1,4 +1,3 @@
-
 aptsync.rb
 ==================================
 Simple `apt-mirror` perl script like utility.
