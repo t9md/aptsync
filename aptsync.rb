@@ -1,17 +1,17 @@
 #!/usr/bin/env ruby
-
 require "fileutils"
 require "zlib"
 require "uri"
 
 CONFIG_FILE         = ARGV[0]
 BASE_DIR            = File.dirname(File.expand_path(__FILE__))
-MIRROR_DIR          = "/var/www/ubuntu_latest"
+MIRROR_DIR          = "#{BASE_DIR}/mirror"
 WORK_DIR            = "#{BASE_DIR}/work"
-BANDWIDTH_LIMIT_KBS = 10000
+BANDWIDTH_LIMIT_KBS = 7000 # kilobytes per second.
+ARCH = %w(amd64)
+# ARCH = %w(amd64 i386)
 
-# wget http://ftp.jaist.ac.jp/pub/Linux/ubuntu/dists/maverick/main/binary-amd64/Packages.gz
-# rsync -avr -H  -n rsync://ftp.jaist.ac.jp/pub/Linux/ubuntu/ --files-from include_list . | tee rsynclog
+Signal.trap(:INT) { puts "Interrupted"; exit 1 }
 
 def config()
   @conf ||= read_config CONFIG_FILE
@@ -40,7 +40,9 @@ def mirror_list
     end
     groups.split.each do |group|
       %w(Release Packages.gz Packages.bz2).map do |file|
-        h[url] << "/dists/#{dist}/#{group}/binary-amd64/#{file}"
+        ARCH.each do |arch|
+          h[url] << "/dists/#{dist}/#{group}/binary-#{arch}/#{file}"
+        end
       end
     end
   end
@@ -55,47 +57,73 @@ end
 
 def sync_packages
   mirror_list.each do |url, files|
-    host = URI.parse(url).host
+    host         = URI.parse(url).host
+    scheme       = URI.parse(url).scheme
+    path         = URI.parse(url).path
     work_dir     = "#{WORK_DIR}/#{host}"
     index_list   = "#{work_dir}/indexes"
     package_list = "#{work_dir}/packages"
-    mirror_dir   = "#{MIRROR_DIR}/#{host}"
-    FileUtils.mkdir_p(work_dir) unless File.directory?(work_dir)
+    work_root    = "#{work_dir}#{path}"
+    mirror_root  = "#{MIRROR_DIR}/#{host}#{path}"
 
     # INDEX:
     #------------------------------------------------------------------
+    FileUtils.mkdir_p work_dir
     File.open(index_list, 'w') {|f| f.puts files }
-    system "rsync --no-motd -avH --bwlimit=#{BANDWIDTH_LIMIT_KBS} --files-from #{index_list} #{url} #{work_dir}"
 
-    gzfiles = files.grep(/Packages.gz$/).map {|gz| File.join(work_dir, gz) }
-    pkgs = gzfiles.inject([]) do |acc, gzfile|
-      acc + Zlib::GzipReader.open( gzfile ).read.scan(/^Filename: (.*?)$/) )
+    if scheme == 'rsync'
+      FileUtils.mkdir_p "#{work_root}"
+      cmd = "rsync -avH --safe-links --bwlimit=#{BANDWIDTH_LIMIT_KBS} --files-from #{index_list} #{url} #{work_root}"
+      system(cmd)
+    elsif scheme == 'http'
+      Dir.chdir(WORK_DIR) do
+        cmd = "cat #{index_list} | sed -e 's/^/\./' | wget -B #{url}/ --limit-rate=#{BANDWIDTH_LIMIT_KBS*1000} -t 0 -r -N -l inf -i -"
+        system(cmd)
+      end
     end
-    File.open(package_list, 'w') {|f| f.puts pkgs.map{|e| "/#{e}"} }
 
     # PACKAGES:
     #------------------------------------------------------------------
-    system "rsync --no-motd -avH --bwlimit=#{BANDWIDTH_LIMIT_KBS} --files-from #{package_list} #{url} #{mirror_dir}"
+    gzfiles =  Dir.glob("#{work_root}/**/Packages.gz")
+    pkgs = gzfiles.inject([]) do |acc, gzfile|
+      acc + Zlib::GzipReader.open( gzfile ).read.scan(/^Filename: (.*?)$/)
+    end
+    File.open(package_list, 'w') {|f| f.puts pkgs.map{|e| "/#{e}"} }
 
-    cleanup(work_dir, index_list)
-    cleanup(mirror_dir, package_list, index_list )
-    FileUtils.rm_rf("#{mirror_dir}/dists", :verbose => true)
-    system("cp -al #{work_dir}/dists #{mirror_dir}")
+    if scheme == 'rsync'
+      FileUtils.mkdir_p "#{mirror_root}"
+      system "rsync -avH -L --safe-links --bwlimit=#{BANDWIDTH_LIMIT_KBS} --files-from #{package_list} #{url} #{mirror_root}"
+    elsif scheme == 'http'
+      Dir.chdir(MIRROR_DIR) do
+        cmd = "cat #{package_list} | sed -e 's/^/\./' | wget -B #{url}/ --limit-rate=#{BANDWIDTH_LIMIT_KBS} -t 0 -r -N -l inf -i -"
+        system(cmd)
+      end
+    end
+
+    # Cleanup:
+    #------------------------------------------------------------------
+    FileUtils.rm_rf("#{mirror_root}/dists", :verbose => true)
+    system("cp -al #{work_root}/dists #{mirror_root}/dists")
+    should_exist = [package_list, index_list].inject([]) do |acc, list|
+      acc + File.open(list).readlines.map{|e| e.chomp.sub(/^\//,'') }
+    end
+    cleanup("#{mirror_root}", should_exist)
   end
 end
 
 # sync_packages
-def cleanup(dir, *file_list)
-  puts "# Cleaning files in `#{dir}' .. not listed in #{file_list.join(" or ")}"
+def cleanup(dir, should_exist)
   puts
-  should_exist = file_list.inject([]) do |acc, file|
-    acc + open(file).readlines.map {|e| File.join(dir, e.chomp) }
-  end
-  actual = Dir.glob("#{dir}/**/*")
-  should_delete = (actual - should_exist).select { |e| FileTest.file? e }
-  unless should_delete.empty?
-    FileUtils.rm_f(should_delete, :verbose => true, :noop => true)
-    # FileUtils.rm_f(should_delete, :verbose => true)
+  puts "## Cleaning files in `#{dir}'"
+  puts
+  Dir.chdir(dir) do
+    actual = Dir.glob("**/*")
+    should_delete = (actual - should_exist).select { |e| FileTest.file? e }
+
+    unless should_delete.empty?
+      # FileUtils.rm_f(should_delete, :verbose => true, :noop => true)
+      FileUtils.rm_f(should_delete, :verbose => true)
+    end
   end
 end
 
